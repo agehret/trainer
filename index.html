@@ -90,7 +90,6 @@ pre.help{background:#12151b;border-radius:10px;padding:10px;font-size:13px;white
 <nav>
   <button data-view="ride" class="on">Fahren</button>
   <button data-view="workouts">Workouts</button>
-  <button data-view="history">Verlauf</button>
   <button data-view="settings">Einstellungen</button>
 </nav>
 <main>
@@ -171,13 +170,6 @@ Beispiel:
   </div>
 </section>
 
-<!-- ================= VERLAUF ================= -->
-<section class="view" id="view-history">
-  <h3>Gespeicherte Fahrten</h3>
-  <p class="muted">Die Fahrten liegen nur in diesem Browser auf deinem Gerät. Exportiere sie als FIT, um sie z. B. zu Strava, intervals.icu oder TrainingPeaks hochzuladen.</p>
-  <div id="hList"></div>
-</section>
-
 <!-- ================= EINSTELLUNGEN ================= -->
 <section class="view" id="view-settings">
   <div class="grid2">
@@ -202,8 +194,8 @@ Beispiel:
       • Kalibrieren (Spindown) bei Bedarf in der Wahoo-App.</p>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Daten</h3>
-      <button class="danger" id="wipeBtn">Alle Fahrten löschen</button>
+      <h3 style="margin-top:0">Hilfe</h3>
+      <button id="diagBtn">Diagnose anzeigen</button>
     </div>
   </div>
 </section>
@@ -396,9 +388,37 @@ async function importZwo(files) {
 /* ============================================================
    Bluetooth: FTMS (Trainer) & Herzfrequenz
    ============================================================ */
-const FTMS = 0x1826, IBD = 0x2ad2, CP = 0x2ad9, HRS = 0x180d, HRM = 0x2a37, CPS = 0x1818;
-const T = { dev: null, cp: null, pending: null, manualOff: false, reconnecting: false };
+// Volle UUIDs als Text: manche Browser (z. B. Bluefy) kommen mit Kurzformen nicht klar
+const uuid16 = n => '0000' + n.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb';
+const FTMS = uuid16(0x1826), IBD = uuid16(0x2ad2), CP = uuid16(0x2ad9), HRS = uuid16(0x180d), HRM = uuid16(0x2a37), CPS = uuid16(0x1818), CPM = uuid16(0x2a63);
+const T = { dev: null, cp: null, pending: null, manualOff: false, reconnecting: false, noInd: false };
 const H = { dev: null, reconnecting: false };
+const diag = []; // Protokoll der Verbindungsschritte
+function dlog(msg) { const line = new Date().toLocaleTimeString('de-DE') + '  ' + msg; diag.push(line); if (diag.length > 60) diag.shift(); console.log(line); }
+function errText(e) {
+  if (e == null) return 'unbekannt';
+  if (typeof e !== 'object') return 'Code ' + String(e);
+  const parts = [];
+  if (e.name) parts.push(e.name);
+  if (e.message) parts.push(e.message);
+  if (e.code != null) parts.push('Code ' + e.code);
+  return parts.join(' – ') || String(e);
+}
+async function tryStep(label, fn, tries = 3) {
+  let last;
+  for (let i = 1; i <= tries; i++) {
+    try { const r = await fn(); dlog('✓ ' + label); return r; }
+    catch (e) { last = e; dlog('✗ ' + label + ' (Versuch ' + i + '): ' + errText(e)); await sleep(300 * i); }
+  }
+  const err = new Error(label + ' fehlgeschlagen: ' + errText(last)); err.step = label; throw err;
+}
+function showDiag(title, e) {
+  modal(`<h2>${esc(title)}</h2><p>${esc(e && e.message ? e.message : errText(e))}</p>
+    <p class="muted">Verbindungsprotokoll (bitte bei Problemen mitschicken):</p>
+    <pre class="help" style="max-height:240px;overflow:auto;-webkit-user-select:text;user-select:text">${esc(diag.join('\n'))}</pre>
+    <p class="muted">Häufige Ursachen: Zwift, Zwift Companion oder die Wahoo-App sind noch mit dem Trainer verbunden (auch auf dem Handy!) · Bluefy hat in den iPad-Einstellungen keine Bluetooth-Erlaubnis · Trainer schläft (kurz pedalieren) · Trainer ist in den iPad-Bluetooth-Einstellungen gekoppelt (dort ggf. „Dieses Gerät ignorieren“).</p>
+    <button class="primary" onclick="closeModal()">OK</button>`);
+}
 
 function setStatus(which, cls, text) {
   const dot = which === 'trainer' ? $('#dotTrainer') : $('#dotHr');
@@ -406,19 +426,41 @@ function setStatus(which, cls, text) {
   if (text != null) (which === 'trainer' ? $('#stTrainer') : $('#stHr')).textContent = text;
 }
 
+function cpWrite(data) {
+  // writeValueWithResponse ist nicht überall vorhanden → writeValue als Ersatz
+  if (T.cp.writeValueWithResponse) return T.cp.writeValueWithResponse(data).catch(() => T.cp.writeValue(data));
+  return T.cp.writeValue(data);
+}
 function cpSend(bytes) {
   return new Promise(resolve => {
     if (!T.cp) return resolve(null);
+    const data = new Uint8Array(bytes);
+    if (T.noInd) { // ohne Rückmeldungen: erfolgreiches Schreiben gilt als OK
+      cpWrite(data).then(() => resolve(1), err => { dlog('Schreibfehler: ' + errText(err)); resolve(null); });
+      return;
+    }
     const timer = setTimeout(() => { T.pending = null; resolve(null); }, 2500);
     T.pending = { op: bytes[0], done: code => { clearTimeout(timer); T.pending = null; resolve(code); } };
-    const data = new Uint8Array(bytes);
-    const w = T.cp.writeValueWithResponse ? T.cp.writeValueWithResponse(data) : T.cp.writeValue(data);
-    w.catch(err => { console.warn('Schreibfehler', err); if (T.pending) T.pending.done(null); });
+    cpWrite(data).catch(err => { dlog('Schreibfehler: ' + errText(err)); if (T.pending) T.pending.done(null); });
   });
 }
 function onCP(e) {
   const v = e.target.value;
   if (v.byteLength >= 3 && v.getUint8(0) === 0x80 && T.pending && T.pending.op === v.getUint8(1)) T.pending.done(v.getUint8(2));
+}
+// Ersatz-Datenquelle: Cycling Power Service (Leistung + Trittfrequenz aus Kurbelumdrehungen)
+let cpmPrev = null;
+function onCPM(dv) {
+  try {
+    const f = dv.getUint16(0, true); const r = { power: dv.getInt16(2, true) }; let o = 4;
+    if (f & 1) o += 1; if (f & 4) o += 2; if (f & 16) o += 6;
+    if (f & 32) {
+      const revs = dv.getUint16(o, true), time = dv.getUint16(o + 2, true);
+      if (cpmPrev) { const dr = (revs - cpmPrev.revs + 65536) % 65536, dt = ((time - cpmPrev.time + 65536) % 65536) / 1024; if (dt > 0) r.cadence = dr / dt * 60; else if (dr === 0) r.cadence = S.cadence; }
+      cpmPrev = { revs, time };
+    }
+    onData(r);
+  } catch (e) {}
 }
 
 function onIBD(dv) {
@@ -450,37 +492,73 @@ async function connectTrainer() {
     T.manualOff = true; try { T.dev.gatt.disconnect(); } catch (e) {}
     return;
   }
+  diag.length = 0;
+  dlog('Browser: ' + navigator.userAgent);
+  let dev = null;
   try {
-    const dev = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [FTMS] }, { namePrefix: 'KICKR' }],
-      optionalServices: [FTMS, CPS, HRS]
-    });
+    // 1. Versuch: nur Geräte mit FTMS anzeigen
+    try {
+      dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [FTMS] }], optionalServices: [CPS, HRS] });
+      dlog('✓ Gerät gewählt (FTMS-Filter): ' + (dev.name || '?'));
+    } catch (e) {
+      if (e && e.name === 'NotFoundError') { dlog('Auswahl abgebrochen'); return; }
+      dlog('✗ Gerätesuche mit FTMS-Filter: ' + errText(e) + ' → versuche alle Geräte');
+      // 2. Versuch: alle Geräte anzeigen
+      dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [FTMS, CPS, HRS] });
+      dlog('✓ Gerät gewählt (alle Geräte): ' + (dev.name || '?'));
+    }
     if (S.demo) toggleDemo();
     T.dev = dev; T.manualOff = false;
     dev.addEventListener('gattserverdisconnected', onTrainerLost);
     await setupTrainer();
   } catch (e) {
-    if (e && e.name !== 'NotFoundError') { setStatus('trainer', 'bad', 'Fehler'); modal(`<h2>Verbindung fehlgeschlagen</h2><p>${esc(e.message || e)}</p><button class="primary" onclick="closeModal()">OK</button>`); }
+    if (e && e.name === 'NotFoundError' && !dev) { dlog('Auswahl abgebrochen'); return; }
+    setStatus('trainer', 'bad', 'Fehler');
+    showDiag('Verbindung fehlgeschlagen', e);
   }
 }
 async function setupTrainer() {
   setStatus('trainer', 'busy', 'Verbinde…');
-  const server = await T.dev.gatt.connect();
-  let svc;
-  try { svc = await server.getPrimaryService(FTMS); }
-  catch (e) { throw new Error('Der Trainer bietet kein FTMS an. Bitte die Firmware in der Wahoo-App aktualisieren.'); }
-  const ibd = await svc.getCharacteristic(IBD);
-  ibd.addEventListener('characteristicvaluechanged', e => onIBD(e.target.value));
-  await ibd.startNotifications();
-  const cp = await svc.getCharacteristic(CP);
-  cp.addEventListener('characteristicvaluechanged', onCP);
-  await cp.startNotifications();
-  T.cp = cp;
-  const code = await cpSend([0x00]); // Steuerung anfordern
-  if (code !== 1) toast('Der Trainer gibt die Steuerung nicht frei. Ist noch Zwift oder die Wahoo-App verbunden?', 6000);
-  await cpSend([0x07]); // Start/Fortsetzen
+  const server = await tryStep('Verbinden (GATT)', () => T.dev.gatt.connected ? T.dev.gatt : T.dev.gatt.connect());
+  await sleep(300);
+  let svc = null;
+  try { svc = await tryStep('FTMS-Dienst finden', () => server.getPrimaryService(FTMS), 2); }
+  catch (e) { dlog('Kein FTMS – Steuerung nicht möglich, versuche nur Leistung zu lesen'); }
+
+  let dataOk = false;
+  if (svc) {
+    try {
+      const ibd = await tryStep('Messdaten (Indoor Bike Data) finden', () => svc.getCharacteristic(IBD));
+      ibd.addEventListener('characteristicvaluechanged', e => onIBD(e.target.value));
+      await tryStep('Messdaten abonnieren', () => ibd.startNotifications());
+      dataOk = true;
+    } catch (e) { dlog('→ weiche auf Cycling Power aus'); }
+  }
+  if (!dataOk) {
+    const cps = await tryStep('Cycling-Power-Dienst finden', () => server.getPrimaryService(CPS), 2);
+    const cpm = await tryStep('Leistungsdaten finden', () => cps.getCharacteristic(CPM));
+    cpmPrev = null;
+    cpm.addEventListener('characteristicvaluechanged', e => onCPM(e.target.value));
+    await tryStep('Leistungsdaten abonnieren', () => cpm.startNotifications());
+  }
+
+  T.cp = null; T.noInd = false;
+  if (svc) {
+    try {
+      const cp = await tryStep('Steuerkanal (Control Point) finden', () => svc.getCharacteristic(CP));
+      cp.addEventListener('characteristicvaluechanged', onCP);
+      try { await tryStep('Steuerkanal-Rückmeldungen abonnieren', () => cp.startNotifications()); }
+      catch (e) { T.noInd = true; dlog('→ steuere ohne Rückmeldungen weiter'); }
+      T.cp = cp;
+      const code = await cpSend([0x00]); // Steuerung anfordern
+      dlog((code === 1 ? '✓' : '✗') + ' Steuerung anfordern (Antwort: ' + code + ')');
+      if (code !== 1 && !T.noInd) toast('Der Trainer gibt die Steuerung nicht frei. Ist noch Zwift oder die Wahoo-App verbunden?', 7000);
+      await cpSend([0x07]);
+    } catch (e) { dlog('Steuerung nicht verfügbar: ' + errText(e)); }
+  }
   S.trainerOk = true; lastSent = null;
-  setStatus('trainer', 'ok', T.dev.name || 'Trainer');
+  setStatus('trainer', T.cp ? 'ok' : 'busy', (T.dev.name || 'Trainer') + (T.cp ? '' : ' (nur Anzeige)'));
+  if (!T.cp) toast('Verbunden, aber ohne Widerstandssteuerung. Details unter Einstellungen → Diagnose.', 7000);
   $('#btnTrainer').textContent = 'Trennen';
   $('#btnTrainer').classList.remove('primary');
   updateControl();
@@ -508,7 +586,7 @@ async function connectHr() {
     H.dev = dev;
     dev.addEventListener('gattserverdisconnected', onHrLost);
     await setupHr();
-  } catch (e) { if (e && e.name !== 'NotFoundError') toast('Pulsgurt: ' + (e.message || e)); }
+  } catch (e) { if (e && e.name !== 'NotFoundError') { dlog('Pulsgurt: ' + errText(e)); toast('Pulsgurt: ' + errText(e), 6000); } }
 }
 async function setupHr() {
   setStatus('hr', 'busy', 'Verbinde…');
@@ -669,54 +747,52 @@ function computeStats(samples) {
   return { avg: sum / n, np, kj: sum / 1000, tss: ps.length * np * IF / (settings.ftp * 3600) * 100, IF, dur: ps.length };
 }
 function endRide() {
-  if (!S.ride || !S.ride.samples.length) { S.running = false; S.ride = null; render(); return; }
-  modal(`<h2>Fahrt beenden?</h2><p class="muted">Die Fahrt wird gespeichert.</p>
-    <div class="row btns"><button class="primary" id="mEnd">Beenden & speichern</button><button id="mDiscard" class="danger">Verwerfen</button><button onclick="closeModal()">Weiterfahren</button></div>`);
-  $('#mEnd').onclick = () => { closeModal(); finalizeRide(true); };
-  $('#mDiscard').onclick = () => { closeModal(); finalizeRide(false); };
+  if (!S.ride || !S.ride.samples.length) { S.running = false; S.ride = null; LS.del('kc.current'); render(); return; }
+  finalizeRide();
 }
-function finalizeRide(save) {
-  const ride = S.ride; S.running = false; S.ride = null; S.elapsed = 0;
+// Beenden: FIT erzeugen, sofort herunterladen, danach alle Aufzeichnungsdaten löschen.
+// Die Datei bleibt nur im Arbeitsspeicher, bis das Fenster geschlossen wird (für „Nochmal herunterladen“).
+function finalizeRide() {
+  let ride = S.ride; S.running = false; S.ride = null; S.elapsed = 0;
+  ride.stats = computeStats(ride.samples);
+  let fit = buildFit(ride);
+  const fname = `Indoor_${fileStamp(ride.start)}.fit`;
+  shareOrDownload(fname, fit, 'application/octet-stream'); // direkt im Klick, damit iOS es zulässt
   LS.del('kc.current');
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   const wasRamp = ride.ramp;
-  S.workout = null; S.wTime = 0; S.workoutDone = false; S.ergOffset = 0;
+  S.workout = null; S.wTime = 0; S.workoutDone = false; S.ergOffset = 0; S.trail = [];
+  S.stats = { avg: 0, np: 0, kj: 0, tss: 0 };
   setMode('sim'); S.grade = 0;
-  render();
-  if (!save) return;
-  ride.stats = computeStats(ride.samples);
-  saveRide(ride);
-  let ftpHtml = '';
+  let ftpHtml = '', est = 0;
   if (wasRamp) {
     let best = 0; const ps = ride.samples.map(s => s[1]);
     for (let i = 60; i <= ps.length; i++) { const a = ps.slice(i - 60, i).reduce((x, y) => x + y, 0) / 60; if (a > best) best = a; }
-    const est = Math.round(best * 0.75);
+    est = Math.round(best * 0.75);
     if (est > 50) ftpHtml = `<p>Beste 1-Minuten-Leistung: <b>${Math.round(best)} W</b><br>Geschätzte FTP (75 %): <b>${est} W</b></p><button class="primary" id="mFtp">FTP auf ${est} W setzen</button>`;
-    setTimeout(() => { const b = $('#mFtp'); if (b) b.onclick = () => { settings.ftp = est; saveSettings(); loadSettingsForm(); b.disabled = true; b.textContent = 'Übernommen ✓'; }; });
   }
-  const st = ride.stats;
-  modal(`<h2>${esc(ride.name)}</h2>
+  const st = ride.stats, dist = ride.dist, name = ride.name;
+  ride = null; // Messdaten verwerfen
+  modal(`<h2>${esc(name)}</h2>
+    <p class="muted">Die Fahrt wurde als <b>${esc(fname)}</b> ausgegeben. Alle Aufzeichnungsdaten werden gelöscht, sobald du dieses Fenster schließt.</p>
     <div class="kv"><div>Dauer</div><div>${fmtTime(st.dur)}</div><div>Ø Leistung</div><div>${Math.round(st.avg)} W</div>
     <div>NP</div><div>${Math.round(st.np)} W</div><div>IF</div><div>${de(st.IF, 2)}</div><div>TSS</div><div>${Math.round(st.tss)}</div>
-    <div>Arbeit</div><div>${Math.round(st.kj)} kJ</div><div>Strecke</div><div>${de(ride.dist / 1000, 2)} km</div></div>
+    <div>Arbeit</div><div>${Math.round(st.kj)} kJ</div><div>Strecke</div><div>${de(dist / 1000, 2)} km</div></div>
     ${ftpHtml}
-    <div class="row btns"><button id="mFit">FIT exportieren</button><button onclick="closeModal()" class="primary">Fertig</button></div>`);
-  $('#mFit').onclick = () => exportFit(ride);
+    <div class="row btns"><button id="mFit">Nochmal herunterladen</button><button id="mDone" class="primary">Fertig</button></div>`);
+  const b = $('#mFtp'); if (b) b.onclick = () => { settings.ftp = est; saveSettings(); loadSettingsForm(); b.disabled = true; b.textContent = 'Übernommen ✓'; };
+  $('#mFit').onclick = () => { if (fit) shareOrDownload(fname, fit, 'application/octet-stream'); };
+  $('#mDone').onclick = () => { fit = null; closeModal(); };
+  render();
 }
-function saveRide(ride) {
-  const rides = LS.get('kc.rides', []);
-  rides.unshift({ id: ride.start, name: ride.name, start: ride.start, dist: ride.dist, stats: ride.stats, samples: ride.samples });
-  while (rides.length > 30) rides.pop();
-  while (!LS.set('kc.rides', rides) && rides.length > 1) rides.pop(); // Speicher voll → älteste weg
-  renderHistory();
-}
+// Nach einem Absturz (z. B. Bluefy geschlossen) liegt evtl. noch eine Zwischenspeicherung vor
 function recoverRide() {
   const cur = LS.get('kc.current', null);
-  if (cur && cur.samples && cur.samples.length > 10) {
-    cur.name += ' (unterbrochen)'; cur.stats = computeStats(cur.samples); saveRide(cur);
-    toast('Eine unterbrochene Fahrt wurde im Verlauf gespeichert.', 5000);
-  }
-  LS.del('kc.current');
+  if (!(cur && cur.samples && cur.samples.length > 10)) { LS.del('kc.current'); return; }
+  modal(`<h2>Unterbrochene Fahrt gefunden</h2><p class="muted">${esc(cur.name)} · ${fmtTime(cur.samples.length)}. Sie wird nach dieser Auswahl gelöscht.</p>
+    <div class="row btns"><button class="primary" id="mRec">Als FIT herunterladen</button><button class="danger" id="mRecDel">Verwerfen</button></div>`);
+  $('#mRec').onclick = () => { cur.stats = computeStats(cur.samples); shareOrDownload(`Indoor_${fileStamp(cur.start)}.fit`, buildFit(cur), 'application/octet-stream'); LS.del('kc.current'); closeModal(); };
+  $('#mRecDel').onclick = () => { LS.del('kc.current'); closeModal(); };
 }
 
 /* ============================================================
@@ -798,15 +874,6 @@ function buildFit(ride) {
   all[all.length - 2] = crc & 0xFF; all[all.length - 1] = crc >> 8;
   return all;
 }
-function exportFit(ride) {
-  shareOrDownload(`Indoor_${fileStamp(ride.start)}.fit`, buildFit(ride), 'application/octet-stream');
-}
-function exportCsv(ride) {
-  const rows = ['zeit,sekunde,leistung_w,trittfrequenz_rpm,puls_bpm,ziel_w,tempo_kmh'];
-  ride.samples.forEach((s, i) => rows.push([new Date(s[0]).toISOString(), i, s[1], Math.round(s[2]), s[3], s[4], (s[5] / 100 * 3.6).toFixed(1)].join(',')));
-  shareOrDownload(`Indoor_${fileStamp(ride.start)}.csv`, rows.join('\n'), 'text/csv');
-}
-
 /* ============================================================
    Grafik
    ============================================================ */
@@ -977,7 +1044,6 @@ $$('nav button').forEach(b => b.onclick = () => {
   $$('nav button').forEach(x => x.classList.toggle('on', x === b));
   $$('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + b.dataset.view));
   if (b.dataset.view === 'workouts') { renderWorkouts(); edUpdate(); }
-  if (b.dataset.view === 'history') renderHistory();
   if (b.dataset.view === 'ride') render();
 });
 window.addEventListener('resize', () => render());
@@ -1048,30 +1114,7 @@ $('#edSave').onclick = () => {
   LS.set('kc.workouts', list); renderWorkouts(); edOpen(null, '', ''); toast('Workout gespeichert');
 };
 
-/* ---------- Verlauf ---------- */
-function renderHistory() {
-  const rides = LS.get('kc.rides', []), list = $('#hList'); list.innerHTML = '';
-  if (!rides.length) { list.innerHTML = '<p class="muted">Noch keine Fahrten gespeichert.</p>'; return; }
-  rides.forEach(r => {
-    const st = r.stats || computeStats(r.samples), d = new Date(r.start);
-    const card = document.createElement('div'); card.className = 'card';
-    card.innerHTML = `<div class="row"><b>${esc(r.name)}</b><span class="muted">${d.toLocaleDateString('de-DE')} ${d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</span></div>
-      <div class="muted" style="margin-top:4px">${fmtTime(st.dur)} · Ø ${Math.round(st.avg)} W · NP ${Math.round(st.np)} W · TSS ${Math.round(st.tss)} · ${Math.round(st.kj)} kJ · ${de((r.dist || 0) / 1000, 1)} km</div>
-      <div class="row btns"><button data-a="fit">FIT</button><button data-a="csv">CSV</button><button data-a="del" class="danger">Löschen</button></div>`;
-    list.appendChild(card);
-    card.querySelector('[data-a="fit"]').onclick = () => exportFit(r);
-    card.querySelector('[data-a="csv"]').onclick = () => exportCsv(r);
-    card.querySelector('[data-a="del"]').onclick = () => {
-      modal(`<h2>Fahrt löschen?</h2><p class="muted">${esc(r.name)} vom ${d.toLocaleDateString('de-DE')} wird endgültig entfernt.</p><div class="row btns"><button class="danger" id="mDel">Löschen</button><button onclick="closeModal()">Abbrechen</button></div>`);
-      $('#mDel').onclick = () => { LS.set('kc.rides', LS.get('kc.rides', []).filter(x => x.id !== r.id)); closeModal(); renderHistory(); };
-    };
-  });
-}
-$('#wipeBtn').onclick = () => {
-  modal(`<h2>Alle Fahrten löschen?</h2><p class="muted">Das kann nicht rückgängig gemacht werden. Workouts und Einstellungen bleiben erhalten.</p><div class="row btns"><button class="danger" id="mWipe">Alle löschen</button><button onclick="closeModal()">Abbrechen</button></div>`);
-  $('#mWipe').onclick = () => { LS.del('kc.rides'); closeModal(); renderHistory(); toast('Alle Fahrten gelöscht'); };
-};
-
+$('#diagBtn').onclick = () => showDiag('Diagnose', { message: S.trainerOk ? 'Trainer verbunden' + (T.cp ? ' mit Steuerung' : ' ohne Steuerung') + (T.noInd ? ' (ohne Rückmeldungen)' : '') : 'Trainer nicht verbunden' });
 /* ---------- Einstellungen ---------- */
 function loadSettingsForm() {
   $('#setFtp').value = settings.ftp; $('#setWeight').value = settings.weight; $('#setStep').value = settings.ergStep;
@@ -1091,6 +1134,7 @@ $('#setSmooth').onchange = () => { settings.smooth3s = $('#setSmooth').checked; 
 /* ---------- Start ---------- */
 if (!navigator.bluetooth) $('#btBanner').style.display = 'block';
 loadSettingsForm();
+LS.del('kc.rides'); // gespeicherte Fahrten aus früheren Versionen entfernen
 recoverRide();
 S.manualTarget = Math.round(settings.ftp * 0.6 / 5) * 5;
 render();
